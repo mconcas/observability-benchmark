@@ -1,0 +1,36 @@
+# Build artifacts
+syslog_injector
+build/
+*.o
+*.out
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+*.cmake
+!CMakeLists.txt
+
+# Results and logs
+results/
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# Socket files
+*.sock
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
