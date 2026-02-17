@@ -144,14 +144,40 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 INDEX_NAME="${INDEX_PREFIX}-${PROFILE}-${TIMESTAMP}"
 
 echo -e "${BLUE}=== OpenSearch Benchmark Test ===${NC}"
+
+# Strip protocol prefix from host if user accidentally included it
+OPENSEARCH_HOST="${OPENSEARCH_HOST#https://}"
+OPENSEARCH_HOST="${OPENSEARCH_HOST#http://}"
+# Strip trailing slashes
+OPENSEARCH_HOST="${OPENSEARCH_HOST%/}"
+
+# Split host into hostname and optional path prefix (e.g. "myhost.com/os" -> host="myhost.com", path="/os")
+if [[ "$OPENSEARCH_HOST" == */* ]]; then
+    OPENSEARCH_PATH="/${OPENSEARCH_HOST#*/}"
+    OPENSEARCH_HOST="${OPENSEARCH_HOST%%/*}"
+    echo -e "${YELLOW}Detected path prefix: $OPENSEARCH_PATH${NC}"
+    # When behind a reverse proxy, default to standard HTTPS/HTTP port
+    if [ "$OPENSEARCH_PORT" = "9200" ]; then
+        if [ "$USE_SSL" = "true" ]; then
+            OPENSEARCH_PORT="443"
+        else
+            OPENSEARCH_PORT="80"
+        fi
+        echo -e "${YELLOW}Auto-set port to $OPENSEARCH_PORT (reverse proxy detected)${NC}"
+    fi
+else
+    OPENSEARCH_PATH=""
+fi
+
 echo "Profile: $PROFILE"
-echo "OpenSearch: $OPENSEARCH_HOST:$OPENSEARCH_PORT"
+echo "OpenSearch: $OPENSEARCH_HOST:$OPENSEARCH_PORT$OPENSEARCH_PATH"
 echo "Index: $INDEX_NAME"
 echo ""
 
 # Export environment variables for fluent-bit config
 export OPENSEARCH_HOST
 export OPENSEARCH_PORT
+export OPENSEARCH_PATH
 export OPENSEARCH_INDEX="$INDEX_NAME"
 
 # Determine TLS setting
@@ -205,22 +231,36 @@ os_curl() {
     local PATH_URL="$2"
     local DATA="$3"
 
-    PROTOCOL="https"
+    local PROTOCOL="https"
     if [ "$USE_SSL" = "false" ]; then
         PROTOCOL="http"
     fi
 
-    CURL_ARGS="curl -sk -X $METHOD"
-    if [ ! -z "$OPENSEARCH_USER" ] && [ ! -z "$OPENSEARCH_PASSWORD" ]; then
-        CURL_ARGS="$CURL_ARGS -u '${OPENSEARCH_USER}:${OPENSEARCH_PASSWORD}'"
+    local URL="${PROTOCOL}://${OPENSEARCH_HOST}"
+    # Only include port if non-standard (not 443 for https, not 80 for http)
+    if [ "$PROTOCOL" = "https" ] && [ "$OPENSEARCH_PORT" != "443" ] && [ ! -z "$OPENSEARCH_PORT" ]; then
+        URL="${URL}:${OPENSEARCH_PORT}"
+    elif [ "$PROTOCOL" = "http" ] && [ "$OPENSEARCH_PORT" != "80" ] && [ ! -z "$OPENSEARCH_PORT" ]; then
+        URL="${URL}:${OPENSEARCH_PORT}"
     fi
-    CURL_ARGS="$CURL_ARGS -H 'Content-Type: application/json'"
-    if [ ! -z "$DATA" ]; then
-        CURL_ARGS="$CURL_ARGS -d '$DATA'"
-    fi
-    CURL_ARGS="$CURL_ARGS '${PROTOCOL}://${OPENSEARCH_HOST}:${OPENSEARCH_PORT}${PATH_URL}'"
+    URL="${URL}${OPENSEARCH_PATH}${PATH_URL}"
 
-    eval "$CURL_ARGS"
+    # Debug: show the URL being called (only when USE_DEBUG is set)
+    if [ "$USE_DEBUG" = true ]; then
+        echo "[os_curl] $METHOD $URL" >&2
+    fi
+
+    local CURL_CMD=(curl -sk -X "$METHOD")
+    if [ ! -z "$OPENSEARCH_USER" ] && [ ! -z "$OPENSEARCH_PASSWORD" ]; then
+        CURL_CMD+=(-u "${OPENSEARCH_USER}:${OPENSEARCH_PASSWORD}")
+    fi
+    CURL_CMD+=(-H "Content-Type: application/json")
+    if [ ! -z "$DATA" ]; then
+        CURL_CMD+=(-d "$DATA")
+    fi
+    CURL_CMD+=("$URL")
+
+    "${CURL_CMD[@]}"
 }
 
 # Set up data stream with index template and static mapping
@@ -278,7 +318,7 @@ TEMPLATE_EOF
     TEMPLATE_BODY="${TEMPLATE_BODY//INDEX_PATTERN_PLACEHOLDER/${DS_NAME}}"
 
     echo "Creating index template..."
-    TEMPLATE_RESULT=$(os_curl PUT "/_index_template/${TEMPLATE_NAME}" "$TEMPLATE_BODY")
+    TEMPLATE_RESULT=$(os_curl PUT "/_index_template/${TEMPLATE_NAME}" "$TEMPLATE_BODY" 2>&1) || true
     if echo "$TEMPLATE_RESULT" | grep -q '"acknowledged":true'; then
         echo -e "${GREEN}✓ Index template created${NC}"
     else
@@ -289,7 +329,7 @@ TEMPLATE_EOF
 
     # Create the data stream
     echo "Creating data stream..."
-    DS_RESULT=$(os_curl PUT "/_data_stream/${DS_NAME}" "")
+    DS_RESULT=$(os_curl PUT "/_data_stream/${DS_NAME}" "" 2>&1) || true
     if echo "$DS_RESULT" | grep -q '"acknowledged":true'; then
         echo -e "${GREEN}✓ Data stream created${NC}"
     else
@@ -330,24 +370,24 @@ if [ "$USE_DEBUG" = true ]; then
     FB_LOG=$(ls -t results/fluentbit_*.log 2>/dev/null | head -1)
     if [ -n "$FB_LOG" ] && [ -f "$FB_LOG" ]; then
         echo -e "${YELLOW}=== Fluent-Bit Log Summary (debug mode) ===${NC}"
-        RETRY_LINES=$(grep -c -i "retry\|retries\|retrying" "$FB_LOG" 2>/dev/null || echo 0)
-        TIMEOUT_LINES=$(grep -c -i "timeout\|timed out" "$FB_LOG" 2>/dev/null || echo 0)
-        ERROR_LINES=$(grep -c -i "error\|failed\|broken" "$FB_LOG" 2>/dev/null || echo 0)
+        RETRY_LINES=$(grep -c -i -E "retry|retries|retrying" "$FB_LOG" 2>/dev/null) || RETRY_LINES=0
+        TIMEOUT_LINES=$(grep -c -i -E "timeout|timed out" "$FB_LOG" 2>/dev/null) || TIMEOUT_LINES=0
+        ERROR_LINES=$(grep -c -i -E "error|failed|broken" "$FB_LOG" 2>/dev/null) || ERROR_LINES=0
 
         echo "  Retry-related log lines:  $RETRY_LINES"
         echo "  Timeout-related log lines: $TIMEOUT_LINES"
         echo "  Error-related log lines:   $ERROR_LINES"
         echo ""
 
-        if [ $TIMEOUT_LINES -gt 0 ]; then
+        if [ "$TIMEOUT_LINES" -gt 0 ]; then
             echo -e "${YELLOW}Sample timeout messages:${NC}"
-            grep -i "timeout\|timed out" "$FB_LOG" | head -5
+            grep -i -E "timeout|timed out" "$FB_LOG" | head -5
             echo ""
         fi
 
-        if [ $RETRY_LINES -gt 0 ]; then
+        if [ "$RETRY_LINES" -gt 0 ]; then
             echo -e "${YELLOW}Sample retry messages:${NC}"
-            grep -i "retry\|retries\|retrying" "$FB_LOG" | head -5
+            grep -i -E "retry|retries|retrying" "$FB_LOG" | head -5
             echo ""
         fi
 
@@ -413,23 +453,27 @@ if [ "$VALIDATE" = true ]; then
     echo -e "${YELLOW}Validating data integrity...${NC}"
     echo ""
 
-    SSL_FLAG=""
+    # Build validation command as array (avoids eval quoting issues)
+    VAL_CMD=(python3 validate_opensearch.py --host "$OPENSEARCH_HOST" --port "$OPENSEARCH_PORT" --index "$INDEX_NAME" --expected-count "$EXPECTED_COUNT")
+
     if [ "$USE_SSL" = "false" ]; then
-        SSL_FLAG="--no-ssl"
+        VAL_CMD+=(--no-ssl)
     fi
 
-    # Build validation command
-    VAL_CMD="python3 validate_opensearch.py --host '$OPENSEARCH_HOST' --port $OPENSEARCH_PORT --index '$INDEX_NAME' --expected-count $EXPECTED_COUNT $SSL_FLAG"
+    # Add path prefix if set
+    if [ ! -z "$OPENSEARCH_PATH" ]; then
+        VAL_CMD+=(--path-prefix "$OPENSEARCH_PATH")
+    fi
 
     # Add credentials only if provided
     if [ ! -z "$OPENSEARCH_USER" ]; then
-        VAL_CMD="$VAL_CMD --user '$OPENSEARCH_USER'"
+        VAL_CMD+=(--user "$OPENSEARCH_USER")
     fi
     if [ ! -z "$OPENSEARCH_PASSWORD" ]; then
-        VAL_CMD="$VAL_CMD --password '$OPENSEARCH_PASSWORD'"
+        VAL_CMD+=(--password "$OPENSEARCH_PASSWORD")
     fi
 
-    if eval "$VAL_CMD"; then
+    if "${VAL_CMD[@]}"; then
 
         echo ""
         echo -e "${GREEN}✓ Validation passed!${NC}"

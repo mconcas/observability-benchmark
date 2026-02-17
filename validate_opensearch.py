@@ -11,13 +11,14 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import ssl
 
-def query_opensearch(host, port, index, user, password, query, use_ssl=True, scroll=None, is_scroll_request=False):
+def query_opensearch(host, port, index, user, password, query, use_ssl=True, scroll=None, is_scroll_request=False, path_prefix=''):
     """Query OpenSearch API"""
     protocol = "https" if use_ssl else "http"
+    base = f"{protocol}://{host}:{port}{path_prefix}"
 
     if is_scroll_request:
         # Scroll continuation request
-        url = f"{protocol}://{host}:{port}/_search/scroll"
+        url = f"{base}/_search/scroll"
         query_body = {
             "scroll": scroll,
             "scroll_id": query  # query contains the scroll_id
@@ -26,9 +27,9 @@ def query_opensearch(host, port, index, user, password, query, use_ssl=True, scr
         # Regular search request
         if scroll:
             # Initial search with scroll - pass scroll as URL parameter
-            url = f"{protocol}://{host}:{port}/{index}/_search?scroll={scroll}"
+            url = f"{base}/{index}/_search?scroll={scroll}"
         else:
-            url = f"{protocol}://{host}:{port}/{index}/_search"
+            url = f"{base}/{index}/_search"
         query_body = query
 
     headers = {
@@ -59,10 +60,10 @@ def query_opensearch(host, port, index, user, password, query, use_ssl=True, scr
         print(f"URL Error: {e.reason}")
         sys.exit(1)
 
-def clear_scroll(host, port, scroll_id, user, password, use_ssl=True):
+def clear_scroll(host, port, scroll_id, user, password, use_ssl=True, path_prefix=''):
     """Clear scroll context"""
     protocol = "https" if use_ssl else "http"
-    url = f"{protocol}://{host}:{port}/_search/scroll"
+    url = f"{protocol}://{host}:{port}{path_prefix}/_search/scroll"
 
     headers = {
         'Content-Type': 'application/json',
@@ -86,7 +87,7 @@ def clear_scroll(host, port, scroll_id, user, password, use_ssl=True):
     except:
         pass  # Ignore errors during cleanup
 
-def get_total_count(host, port, index, user, password, use_ssl=True):
+def get_total_count(host, port, index, user, password, use_ssl=True, path_prefix=''):
     """Get total document count in index"""
     query = {
         "query": {"match_all": {}},
@@ -94,10 +95,10 @@ def get_total_count(host, port, index, user, password, use_ssl=True):
         "track_total_hits": True
     }
 
-    result = query_opensearch(host, port, index, user, password, query, use_ssl)
+    result = query_opensearch(host, port, index, user, password, query, use_ssl, path_prefix=path_prefix)
     return result['hits']['total']['value']
 
-def get_message_counters(host, port, index, user, password, use_ssl=True):
+def get_message_counters(host, port, index, user, password, use_ssl=True, path_prefix=''):
     """Extract all message counters and document _ids from the index using scroll API"""
     counters = []
     # Map: message_counter -> list of (_id, @timestamp) for duplicate diagnosis
@@ -127,7 +128,7 @@ def get_message_counters(host, port, index, user, password, use_ssl=True):
                 counter_to_ids[counter_val].append((doc_id, timestamp))
 
     # Initial search request with scroll
-    result = query_opensearch(host, port, index, user, password, query, use_ssl, scroll="2m")
+    result = query_opensearch(host, port, index, user, password, query, use_ssl, scroll="2m", path_prefix=path_prefix)
     scroll_id = result.get('_scroll_id')
     hits = result['hits']['hits']
 
@@ -140,7 +141,7 @@ def get_message_counters(host, port, index, user, password, use_ssl=True):
     while len(hits) > 0:
         # Scroll to next batch
         result = query_opensearch(host, port, index, user, password, scroll_id, use_ssl,
-                                  scroll="2m", is_scroll_request=True)
+                                  scroll="2m", is_scroll_request=True, path_prefix=path_prefix)
         scroll_id = result.get('_scroll_id')
         hits = result['hits']['hits']
 
@@ -157,7 +158,7 @@ def get_message_counters(host, port, index, user, password, use_ssl=True):
 
     # Clear scroll context
     if scroll_id:
-        clear_scroll(host, port, scroll_id, user, password, use_ssl)
+        clear_scroll(host, port, scroll_id, user, password, use_ssl, path_prefix=path_prefix)
 
     if batch_count > 1:
         print(f"  Fetched {total_fetched:,} documents, extracted {len(counters):,} counters    ")
@@ -224,6 +225,7 @@ def main():
     parser.add_argument('--password', help='OpenSearch password')
     parser.add_argument('--expected-count', type=int, help='Expected message count')
     parser.add_argument('--no-ssl', action='store_true', help='Disable SSL')
+    parser.add_argument('--path-prefix', default='', help='URL path prefix (e.g. /os for reverse proxy)')
     parser.add_argument('--json', action='store_true', help='Output results as JSON')
 
     args = parser.parse_args()
@@ -236,7 +238,7 @@ def main():
         print()
 
     # Get total count
-    total = get_total_count(args.host, args.port, args.index, args.user, args.password, use_ssl)
+    total = get_total_count(args.host, args.port, args.index, args.user, args.password, use_ssl, path_prefix=args.path_prefix)
 
     if not args.json:
         print(f"Total documents in index: {total}")
@@ -248,7 +250,7 @@ def main():
     if not args.json:
         print("Extracting message counters...")
 
-    counters, counter_to_ids = get_message_counters(args.host, args.port, args.index, args.user, args.password, use_ssl)
+    counters, counter_to_ids = get_message_counters(args.host, args.port, args.index, args.user, args.password, use_ssl, path_prefix=args.path_prefix)
 
     # Validate
     results = validate_integrity(counters, args.expected_count)
