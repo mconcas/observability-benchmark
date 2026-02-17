@@ -186,9 +186,11 @@ echo ""
 # Optional: Collect metrics after test
 if [ $COLLECT_METRICS -eq 1 ]; then
     echo ""
-    echo "Waiting for Fluent-bit to flush buffers..."
-    sleep 30
 
+    echo "Waiting for Fluent-bit to flush buffers..."
+    sleep 5
+
+    echo ""
     echo "Collecting post-test metrics..."
     curl -s http://localhost:2020/api/v1/metrics > "$OUTPUT_DIR/metrics_after_${TIMESTAMP}.json" || true
 
@@ -201,17 +203,45 @@ if [ $COLLECT_METRICS -eq 1 ]; then
         AFTER="$OUTPUT_DIR/metrics_after_${TIMESTAMP}.json"
 
         if [ -f "$AFTER" ]; then
-            INPUT_RECORDS=$(jq -r '(.input | to_entries | .[0].value.records) // "N/A"' "$AFTER" 2>/dev/null)
-            INPUT_BYTES=$(jq -r '(.input | to_entries | .[0].value.bytes) // "N/A"' "$AFTER" 2>/dev/null)
-            OUTPUT_RECORDS=$(jq -r '(.output | to_entries | .[0].value.proc_records) // (.output | to_entries | .[0].value.records) // "N/A"' "$AFTER" 2>/dev/null)
-            OUTPUT_BYTES=$(jq -r '(.output | to_entries | .[0].value.proc_bytes) // (.output | to_entries | .[0].value.bytes) // "N/A"' "$AFTER" 2>/dev/null)
-            ERRORS=$(jq -r '(.output | to_entries | .[0].value.errors) // "N/A"' "$AFTER" 2>/dev/null)
+            INPUT_RECORDS=$(jq -r '(.input | to_entries | .[0].value.records) // "0"' "$AFTER" 2>/dev/null)
+            INPUT_BYTES=$(jq -r '(.input | to_entries | .[0].value.bytes) // "0"' "$AFTER" 2>/dev/null)
+            OUTPUT_RECORDS=$(jq -r '(.output | to_entries | .[0].value.proc_records) // (.output | to_entries | .[0].value.records) // "0"' "$AFTER" 2>/dev/null)
+            OUTPUT_BYTES=$(jq -r '(.output | to_entries | .[0].value.proc_bytes) // (.output | to_entries | .[0].value.bytes) // "0"' "$AFTER" 2>/dev/null)
+            ERRORS=$(jq -r '(.output | to_entries | .[0].value.errors) // "0"' "$AFTER" 2>/dev/null)
+            RETRIES=$(jq -r '(.output | to_entries | .[0].value.retries) // "0"' "$AFTER" 2>/dev/null)
+            RETRIED_RECORDS=$(jq -r '(.output | to_entries | .[0].value.retried_records) // "0"' "$AFTER" 2>/dev/null)
+            DROPPED=$(jq -r '(.output | to_entries | .[0].value.dropped_records) // "0"' "$AFTER" 2>/dev/null)
 
-            echo "Fluent-bit Input records: $INPUT_RECORDS" | tee -a "$RESULT_FILE"
-            echo "Fluent-bit Input bytes: $INPUT_BYTES" | tee -a "$RESULT_FILE"
-            echo "Fluent-bit Output records: $OUTPUT_RECORDS" | tee -a "$RESULT_FILE"
-            echo "Fluent-bit Output bytes: $OUTPUT_BYTES" | tee -a "$RESULT_FILE"
-            echo "Fluent-bit Errors: $ERRORS" | tee -a "$RESULT_FILE"
+            # Compute derived metrics
+            TOTAL_ATTEMPTS=$((OUTPUT_RECORDS + RETRIED_RECORDS))
+            if [ "$INPUT_RECORDS" -gt 0 ] 2>/dev/null; then
+                RETRY_RATIO=$(echo "scale=2; $RETRIED_RECORDS / $INPUT_RECORDS" | bc 2>/dev/null || echo "N/A")
+                OVERHEAD_FACTOR=$(echo "scale=2; $TOTAL_ATTEMPTS / $INPUT_RECORDS" | bc 2>/dev/null || echo "N/A")
+            else
+                RETRY_RATIO="N/A"
+                OVERHEAD_FACTOR="N/A"
+            fi
+
+            echo "" | tee -a "$RESULT_FILE"
+            echo "--- Input ---" | tee -a "$RESULT_FILE"
+            echo "  Records ingested:        $INPUT_RECORDS" | tee -a "$RESULT_FILE"
+            echo "  Bytes ingested:          $INPUT_BYTES" | tee -a "$RESULT_FILE"
+            echo "" | tee -a "$RESULT_FILE"
+            echo "--- Output ---" | tee -a "$RESULT_FILE"
+            echo "  Records accepted by OS:  $OUTPUT_RECORDS  (got 2xx/409 response)" | tee -a "$RESULT_FILE"
+            echo "  Records re-queued:       $RETRIED_RECORDS  (timed out or got 429/5xx, sent again)" | tee -a "$RESULT_FILE"
+            echo "  Total send attempts:     $TOTAL_ATTEMPTS  (accepted + re-queued)" | tee -a "$RESULT_FILE"
+            echo "  Bytes sent to OS:        $OUTPUT_BYTES" | tee -a "$RESULT_FILE"
+            echo "" | tee -a "$RESULT_FILE"
+            echo "--- Reliability ---" | tee -a "$RESULT_FILE"
+            echo "  Chunk retries:           $RETRIES  (number of chunk-level retry events)" | tee -a "$RESULT_FILE"
+            echo "  Retry overhead:          ${RETRY_RATIO}x  (re-queued records / input records)" | tee -a "$RESULT_FILE"
+            echo "  Total overhead:          ${OVERHEAD_FACTOR}x  (total attempts / input records)" | tee -a "$RESULT_FILE"
+            echo "  Errors:                  $ERRORS  (permanent output plugin failures)" | tee -a "$RESULT_FILE"
+            echo "  Dropped records:         $DROPPED  (records lost after exhausting retries)" | tee -a "$RESULT_FILE"
+            echo "" | tee -a "$RESULT_FILE"
+            echo "--- Timing ---" | tee -a "$RESULT_FILE"
+            echo "  Drain time:              ${DRAIN_DURATION_S}s  (time to flush all buffers after injection)" | tee -a "$RESULT_FILE"
         fi
     fi
 fi

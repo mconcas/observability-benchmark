@@ -26,6 +26,8 @@ PREV_INPUT_RECORDS=0
 PREV_OUTPUT_RECORDS=0
 PREV_OUTPUT_RETRIES=0
 PREV_OUTPUT_ERRORS=0
+PREV_NET_TX=0
+PREV_NET_RX=0
 PREV_TIME=$(date +%s)
 
 while true; do
@@ -56,17 +58,37 @@ while true; do
     STORAGE_CHUNKS_UP=$(echo "$METRICS" | grep '^fluentbit_storage_chunks_up{' | grep -v '#' | awk '{sum+=$2} END {print sum+0}')
     STORAGE_CHUNKS_DOWN=$(echo "$METRICS" | grep '^fluentbit_storage_chunks_down{' | grep -v '#' | awk '{sum+=$2} END {print sum+0}')
 
+    # Collect actual network bandwidth via ss (socket statistics)
+    # Find fluent-bit PID and sum bytes_sent/bytes_received across its TCP connections
+    FB_PID=$(pgrep -x fluent-bit 2>/dev/null | head -1)
+    NET_TX=0
+    NET_RX=0
+    NET_CONNS=0
+    if [ ! -z "$FB_PID" ] && command -v ss &>/dev/null; then
+        # ss -tipn shows TCP socket info with byte counters per connection
+        SS_OUTPUT=$(ss -tipn 2>/dev/null | grep -A1 "pid=${FB_PID}," || true)
+        if [ ! -z "$SS_OUTPUT" ]; then
+            NET_TX=$(echo "$SS_OUTPUT" | grep -oP 'bytes_sent:\K[0-9]+' | awk '{sum+=$1} END {print sum+0}')
+            NET_RX=$(echo "$SS_OUTPUT" | grep -oP 'bytes_acked:\K[0-9]+' | awk '{sum+=$1} END {print sum+0}')
+            NET_CONNS=$(echo "$SS_OUTPUT" | grep -c "pid=${FB_PID}," || echo 0)
+        fi
+    fi
+
     # Calculate rates
     if [ $ELAPSED -gt 0 ]; then
         INPUT_RATE=$(( (INPUT_RECORDS - PREV_INPUT_RECORDS) / ELAPSED ))
         OUTPUT_RATE=$(( (OUTPUT_RECORDS - PREV_OUTPUT_RECORDS) / ELAPSED ))
         RETRY_RATE=$(( (OUTPUT_RETRIES - PREV_OUTPUT_RETRIES) / ELAPSED ))
         ERROR_RATE=$(( (OUTPUT_ERRORS - PREV_OUTPUT_ERRORS) / ELAPSED ))
+        NET_TX_RATE=$(( (NET_TX - PREV_NET_TX) / ELAPSED ))
+        NET_RX_RATE=$(( (NET_RX - PREV_NET_RX) / ELAPSED ))
     else
         INPUT_RATE=0
         OUTPUT_RATE=0
         RETRY_RATE=0
         ERROR_RATE=0
+        NET_TX_RATE=0
+        NET_RX_RATE=0
     fi
 
     # Calculate lag (difference between input and output)
@@ -113,6 +135,56 @@ while true; do
     fi
     echo ""
 
+    # Network bandwidth section
+    echo -e "${BLUE}NETWORK (Actual TCP Bandwidth)${NC}"
+    if [ ! -z "$FB_PID" ] && [ $NET_TX -gt 0 -o $NET_RX -gt 0 ]; then
+        # Format bytes into human-readable units
+        format_bytes() {
+            local bytes=$1
+            if [ $bytes -ge 1073741824 ]; then
+                printf "%.2f GB" $(echo "scale=2; $bytes / 1073741824" | bc)
+            elif [ $bytes -ge 1048576 ]; then
+                printf "%.2f MB" $(echo "scale=2; $bytes / 1048576" | bc)
+            elif [ $bytes -ge 1024 ]; then
+                printf "%.2f KB" $(echo "scale=2; $bytes / 1024" | bc)
+            else
+                printf "%d B" $bytes
+            fi
+        }
+        format_rate() {
+            local bytes=$1
+            if [ $bytes -ge 1048576 ]; then
+                printf "%.2f MB/s" $(echo "scale=2; $bytes / 1048576" | bc)
+            elif [ $bytes -ge 1024 ]; then
+                printf "%.2f KB/s" $(echo "scale=2; $bytes / 1024" | bc)
+            else
+                printf "%d B/s" $bytes
+            fi
+        }
+
+        TX_TOTAL=$(format_bytes $NET_TX)
+        RX_TOTAL=$(format_bytes $NET_RX)
+        TX_RATE_FMT=$(format_rate $NET_TX_RATE)
+        RX_RATE_FMT=$(format_rate $NET_RX_RATE)
+
+        printf "  Sent (TX):     %15s  |  Rate: %15s\n" "$TX_TOTAL" "$TX_RATE_FMT"
+        printf "  Received (RX): %15s  |  Rate: %15s\n" "$RX_TOTAL" "$RX_RATE_FMT"
+        printf "  Connections:   %15d  |  PID:  %15d\n" $NET_CONNS $FB_PID
+
+        # Show overhead: compare actual network bytes vs fluent-bit payload bytes
+        if [ $OUTPUT_BYTES -gt 0 ] && [ $NET_TX -gt 0 ]; then
+            OVERHEAD=$(echo "scale=1; ($NET_TX * 100 / $OUTPUT_BYTES) - 100" | bc 2>/dev/null || echo "N/A")
+            echo "  Wire overhead vs payload: ~${OVERHEAD}% (HTTP headers, bulk API framing, retries)"
+        fi
+    else
+        if [ -z "$FB_PID" ]; then
+            echo -e "  ${YELLOW}fluent-bit process not found (cannot read socket stats)${NC}"
+        else
+            echo "  No active TCP connections detected (PID: $FB_PID)"
+        fi
+    fi
+    echo ""
+
     if [ $STORAGE_CHUNKS_UP -gt 0 ] || [ $STORAGE_CHUNKS_DOWN -gt 0 ]; then
         echo -e "${BLUE}STORAGE (Filesystem Buffering)${NC}"
         printf "  Chunks Up (memory):  %'10d\n" $STORAGE_CHUNKS_UP
@@ -142,6 +214,8 @@ while true; do
     PREV_OUTPUT_RECORDS=$OUTPUT_RECORDS
     PREV_OUTPUT_RETRIES=$OUTPUT_RETRIES
     PREV_OUTPUT_ERRORS=$OUTPUT_ERRORS
+    PREV_NET_TX=$NET_TX
+    PREV_NET_RX=$NET_RX
     PREV_TIME=$CURRENT_TIME
 
     sleep $INTERVAL

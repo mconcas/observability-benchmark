@@ -98,31 +98,40 @@ def get_total_count(host, port, index, user, password, use_ssl=True):
     return result['hits']['total']['value']
 
 def get_message_counters(host, port, index, user, password, use_ssl=True):
-    """Extract all message counters from the index using scroll API"""
+    """Extract all message counters and document _ids from the index using scroll API"""
     counters = []
+    # Map: message_counter -> list of (_id, @timestamp) for duplicate diagnosis
+    counter_to_ids = {}
 
     # Initial query with scroll (scroll parameter will be in URL)
     query = {
         "query": {"match_all": {}},
         "size": 10000,  # Batch size per scroll request
         "sort": [{"@timestamp": "asc"}, {"_id": "asc"}],  # Stable sort with _id as tiebreaker
-        "_source": ["message"]
+        "_source": ["message", "@timestamp"]
     }
+
+    def process_hits(hits):
+        for hit in hits:
+            source = hit['_source']
+            message = source.get('message', '')
+            doc_id = hit['_id']
+            timestamp = source.get('@timestamp', '')
+
+            match = re.search(r'Test message #(\d+)', message)
+            if match:
+                counter_val = int(match.group(1))
+                counters.append(counter_val)
+                if counter_val not in counter_to_ids:
+                    counter_to_ids[counter_val] = []
+                counter_to_ids[counter_val].append((doc_id, timestamp))
 
     # Initial search request with scroll
     result = query_opensearch(host, port, index, user, password, query, use_ssl, scroll="2m")
     scroll_id = result.get('_scroll_id')
     hits = result['hits']['hits']
 
-    # Extract counters from first batch
-    for hit in hits:
-        source = hit['_source']
-        message = source.get('message', '')
-
-        # Extract counter from message like "Test message #123"
-        match = re.search(r'Test message #(\d+)', message)
-        if match:
-            counters.append(int(match.group(1)))
+    process_hits(hits)
 
     total_fetched = len(hits)
     batch_count = 1
@@ -140,15 +149,7 @@ def get_message_counters(host, port, index, user, password, use_ssl=True):
 
         batch_count += 1
         total_fetched += len(hits)
-
-        # Extract counters from this batch
-        for hit in hits:
-            source = hit['_source']
-            message = source.get('message', '')
-
-            match = re.search(r'Test message #(\d+)', message)
-            if match:
-                counters.append(int(match.group(1)))
+        process_hits(hits)
 
         # Print progress for large datasets
         if batch_count % 10 == 0:
@@ -161,17 +162,19 @@ def get_message_counters(host, port, index, user, password, use_ssl=True):
     if batch_count > 1:
         print(f"  Fetched {total_fetched:,} documents, extracted {len(counters):,} counters    ")
 
-    return sorted(counters)
+    return sorted(counters), counter_to_ids
 
 def validate_integrity(counters, expected_count=None):
     """Validate message sequence integrity"""
     results = {
         'total_messages': len(counters),
         'expected_count': expected_count,
+        'unique_messages': 0,
         'count_match': False,
         'sequence_valid': True,
         'gaps': [],
-        'duplicates': [],
+        'duplicates': {},
+        'total_duplicates': 0,
         'first_counter': None,
         'last_counter': None,
     }
@@ -182,28 +185,32 @@ def validate_integrity(counters, expected_count=None):
     results['first_counter'] = counters[0]
     results['last_counter'] = counters[-1]
 
-    # Check count
+    # Count occurrences of each counter to detect duplicates
+    from collections import Counter
+    counter_counts = Counter(counters)
+    unique_counters = sorted(counter_counts.keys())
+
+    results['unique_messages'] = len(unique_counters)
+
+    # Check count against expected (using unique messages)
     if expected_count:
-        results['count_match'] = (len(counters) == expected_count)
+        results['count_match'] = (results['unique_messages'] == expected_count)
 
-    # Check for gaps and duplicates
-    prev = counters[0] - 1
-    seen = set()
+    # Check for duplicates
+    for val, count in counter_counts.items():
+        if count > 1:
+            results['duplicates'][val] = count
+            results['total_duplicates'] += count - 1  # extra copies
+            results['sequence_valid'] = False
 
-    for counter in counters:
-        # Check for gaps
+    # Check for gaps using unique sorted counters
+    prev = unique_counters[0] - 1
+    for counter in unique_counters:
         if counter != prev + 1:
             gap_start = prev + 1
             gap_end = counter - 1
             results['gaps'].append((gap_start, gap_end))
             results['sequence_valid'] = False
-
-        # Check for duplicates
-        if counter in seen:
-            results['duplicates'].append(counter)
-            results['sequence_valid'] = False
-
-        seen.add(counter)
         prev = counter
 
     return results
@@ -241,46 +248,83 @@ def main():
     if not args.json:
         print("Extracting message counters...")
 
-    counters = get_message_counters(args.host, args.port, args.index, args.user, args.password, use_ssl)
+    counters, counter_to_ids = get_message_counters(args.host, args.port, args.index, args.user, args.password, use_ssl)
 
     # Validate
     results = validate_integrity(counters, args.expected_count)
 
     if args.json:
-        print(json.dumps(results, indent=2))
+        # Convert duplicates dict keys to strings for JSON serialization
+        json_results = dict(results)
+        json_results['duplicates'] = {str(k): v for k, v in results['duplicates'].items()}
+        print(json.dumps(json_results, indent=2))
     else:
         print()
         print("=== Validation Results ===")
-        print(f"Messages found: {results['total_messages']}")
+        print(f"Total documents in index: {results['total_messages']}")
+        print(f"Unique messages: {results['unique_messages']}")
 
         if results['first_counter'] is not None:
             print(f"Counter range: {results['first_counter']} to {results['last_counter']}")
 
         if results['expected_count']:
             status = "✓ PASS" if results['count_match'] else "✗ FAIL"
-            print(f"Count match: {status}")
+            print(f"Unique count vs expected ({results['expected_count']}): {status}")
+
+        if results['total_duplicates'] > 0:
+            dup_ratio = results['total_messages'] / results['unique_messages'] if results['unique_messages'] > 0 else 0
+            print(f"\nDuplicates: {results['total_duplicates']:,} extra copies ({dup_ratio:.1f}x average duplication)")
+            # Show the most duplicated counters
+            sorted_dups = sorted(results['duplicates'].items(), key=lambda x: -x[1])
+            print(f"Most duplicated values (showing top 10 of {len(results['duplicates']):,}):")
+            for val, count in sorted_dups[:10]:
+                print(f"  - Counter {val}: {count} copies")
+            if len(sorted_dups) > 10:
+                print(f"  ... and {len(sorted_dups) - 10} more")
+
+            # Diagnose Generate_ID effectiveness: do duplicates share _id?
+            print(f"\n--- Generate_ID Diagnosis ---")
+            same_id_count = 0
+            diff_id_count = 0
+            sample_dups = sorted_dups[:5]  # Examine top 5 duplicated counters
+            for val, count in sample_dups:
+                entries = counter_to_ids.get(val, [])
+                ids = [e[0] for e in entries]
+                unique_ids = set(ids)
+                if len(unique_ids) == 1:
+                    same_id_count += 1
+                else:
+                    diff_id_count += 1
+                    print(f"  Counter {val} ({count} copies):")
+                    for doc_id, ts in entries[:4]:  # Show up to 4
+                        print(f"    _id={doc_id}  @timestamp={ts}")
+                    if len(entries) > 4:
+                        print(f"    ... and {len(entries) - 4} more")
+
+            if diff_id_count > 0:
+                print(f"\n  → {diff_id_count}/{len(sample_dups)} sampled duplicates have DIFFERENT _id values")
+                print(f"  → Generate_ID is NOT producing deterministic IDs for retried records")
+                print(f"  → Possible cause: record content changes between original send and retry")
+            elif same_id_count > 0:
+                print(f"\n  → {same_id_count}/{len(sample_dups)} sampled duplicates share the SAME _id")
+                print(f"  → Generate_ID IS deterministic, but OpenSearch stored duplicates anyway")
+                print(f"  → Possible cause: data stream routing to different backing indices")
 
         if results['sequence_valid']:
-            print("Sequence integrity: ✓ PASS (no gaps or duplicates)")
+            print("\nSequence integrity: ✓ PASS (no gaps or duplicates)")
         else:
-            print("Sequence integrity: ✗ FAIL")
-
             if results['gaps']:
-                print(f"\nGaps found ({len(results['gaps'])}): ")
+                total_missing = sum(gap_end - gap_start + 1 for gap_start, gap_end in results['gaps'])
+                print(f"\nGaps found ({len(results['gaps'])} gaps, {total_missing:,} missing counters):")
                 for gap_start, gap_end in results['gaps'][:10]:  # Show first 10
                     if gap_start == gap_end:
                         print(f"  - Missing: {gap_start}")
                     else:
-                        print(f"  - Missing: {gap_start} to {gap_end}")
+                        print(f"  - Missing: {gap_start} to {gap_end} ({gap_end - gap_start + 1} values)")
                 if len(results['gaps']) > 10:
                     print(f"  ... and {len(results['gaps']) - 10} more")
-
-            if results['duplicates']:
-                print(f"\nDuplicates found ({len(results['duplicates'])}): ")
-                for dup in results['duplicates'][:10]:  # Show first 10
-                    print(f"  - {dup}")
-                if len(results['duplicates']) > 10:
-                    print(f"  ... and {len(results['duplicates']) - 10} more")
+            elif results['total_duplicates'] > 0 and not results['gaps']:
+                print("\nSequence: ✓ No gaps (all counters present), but duplicates exist")
 
         print()
 
